@@ -8,10 +8,11 @@ import pandas as pd
 import numpy as np
 import joblib
 import os
+from sklearn.utils import resample
 
 # Paths
 DATA_PATH = "C:\\Users\\revan\\Desktop\\face-mesh-react\\JoyVerseDataSet_Filled.xlsx"
-MODEL_DIR = "."  # Save directly to backend/
+MODEL_DIR = "."
 os.makedirs(MODEL_DIR, exist_ok=True)
 
 # Check CUDA
@@ -26,23 +27,28 @@ def check_data(data, name="Data"):
     print(f"{name} - Min:", np.nanmin(data), "Max:", np.nanmax(data))
 
 # Load and Preprocess Data
-df = pd.read_excel(DATA_PATH)
+try:
+    df = pd.read_excel(DATA_PATH)
+    print(f"Dataset loaded: {len(df)} rows")
+except Exception as e:
+    print(f"Error loading dataset: {e}")
+    exit(1)
+
 df = df[df["Expression"].notna()]  # Remove rows with NaN in Expression
 X = df.drop(columns=["Expression", "FileName"]).fillna(df.drop(columns=["Expression", "FileName"]).mean()).values.astype(np.float32)
 y = df["Expression"]
-# Balance dataset
-from sklearn.utils import resample
+
+# Strict class balancing
 df_balanced = pd.DataFrame()
 for expr in df["Expression"].unique():
     df_expr = df[df["Expression"] == expr]
-    df_expr_resampled = resample(df_expr, n_samples=50, random_state=42)  # Equal samples
+    df_expr_resampled = resample(df_expr, n_samples=50, random_state=42, replace=True)
     df_balanced = pd.concat([df_balanced, df_expr_resampled])
-df = df_balanced
+X = df_balanced.drop(columns=["Expression", "FileName"]).values.astype(np.float32)
+y = df_balanced["Expression"]
 
 # Check raw data
 check_data(X, "Raw X")
-
-# Log class distribution to check for imbalance
 print("Class distribution:", pd.Series(y).value_counts())
 
 # Normalize features
@@ -61,27 +67,35 @@ class ExpressionDataset(Dataset):
         assert X.shape[1] == 468 * 3, f"Expected 468*3 features, got {X.shape[1]}"
         self.X = torch.tensor(X, dtype=torch.float32)
         self.y = torch.tensor(y, dtype=torch.long)
-    def __len__(self): return len(self.y)
-    def __getitem__(self, idx): return self.X[idx], self.y[idx]
+    def __len__(self):
+        return len(self.y)
+    def __getitem__(self, idx):
+        return self.X[idx], self.y[idx]
 
-# Simple MLP Model
+# Enhanced MLP Model
 class SimpleClassifier(nn.Module):
     def __init__(self, input_dim=468*3, num_classes=6):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Linear(input_dim, 256),  # Increased hidden layer size
+            nn.Linear(input_dim, 512),
+            nn.BatchNorm1d(512),
             nn.ReLU(),
-            nn.Dropout(0.3),  # Adjusted dropout
+            nn.Dropout(0.4),
+            nn.Linear(512, 256),
+            nn.BatchNorm1d(256),
+            nn.ReLU(),
+            nn.Dropout(0.4),
             nn.Linear(256, 128),
+            nn.BatchNorm1d(128),
             nn.ReLU(),
-            nn.Dropout(0.3),
+            nn.Dropout(0.4),
             nn.Linear(128, num_classes)
         )
     def forward(self, x):
         return self.net(x.flatten(1))
 
 # Training Function
-def train_model(train_loader, val_loader, model, criterion, optimizer, scheduler, device, epochs=50, patience=10):
+def train_model(train_loader, val_loader, model, criterion, optimizer, scheduler, device, epochs=100, patience=15):
     best_val_acc = 0
     patience_counter = 0
     for epoch in range(epochs):
@@ -91,34 +105,35 @@ def train_model(train_loader, val_loader, model, criterion, optimizer, scheduler
             xb, yb = xb.to(device), yb.to(device)
             preds = model(xb)
             loss = criterion(preds, yb)
-
             if torch.isnan(loss) or torch.isinf(loss):
-                print(f"NaN/Inf loss detected at epoch {epoch+1}")
+                print(f"NaN/Inf loss at epoch {epoch+1}")
                 return False
-
             optimizer.zero_grad()
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
             total_loss += loss.item()
-        scheduler.step()
         print(f"Epoch {epoch+1}/{epochs} | Train Loss: {total_loss/len(train_loader):.4f}")
 
         # Validation
         model.eval()
         correct = 0
         total = 0
+        val_loss = 0
         with torch.no_grad():
             for xb, yb in val_loader:
                 xb, yb = xb.to(device), yb.to(device)
                 preds = model(xb)
+                val_loss += criterion(preds, yb).item()
                 correct += (preds.argmax(1) == yb).sum().item()
                 total += yb.size(0)
         val_acc = 100 * correct / total
-        print(f"Validation Accuracy: {val_acc:.2f}%")
+        val_loss /= len(val_loader)
+        print(f"Validation Accuracy: {val_acc:.2f}% | Validation Loss: {val_loss:.4f}")
+        scheduler.step(val_loss)
 
         # Early Stopping
-        if val_acc > best_val_acc:
+        if val_acc > best_val_acc + 0.5:  # Significant improvement
             best_val_acc = val_acc
             patience_counter = 0
             torch.save(model.state_dict(), os.path.join(MODEL_DIR, "best_model.pt"))
@@ -129,7 +144,7 @@ def train_model(train_loader, val_loader, model, criterion, optimizer, scheduler
                 break
     return True
 
-# Single Train-Test Split
+# Data Split
 X_train_val, X_test, y_train_val, y_test = train_test_split(X, y_encoded, test_size=0.2, stratify=y_encoded, random_state=42)
 X_train, X_val, y_train, y_val = train_test_split(X_train_val, y_train_val, test_size=0.2, stratify=y_train_val, random_state=42)
 
@@ -144,13 +159,9 @@ test_loader = DataLoader(test_ds, batch_size=32)
 # Model Setup
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 model = SimpleClassifier(num_classes=len(le.classes_)).to(device)
-optimizer = torch.optim.Adam(model.parameters(), lr=1e-3, weight_decay=1e-5)  # Increased learning rate
-scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=5, gamma=0.7)
+optimizer = torch.optim.Adam(model.parameters(), lr=1e-3, weight_decay=1e-4)
+scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5)
 criterion = nn.CrossEntropyLoss()
-
-# Debug Device
-print(f"Model device: {next(model.parameters()).device}")
-print(f"Input device: {train_ds[0][0].to(device).device}")
 
 # Train
 success = train_model(train_loader, val_loader, model, criterion, optimizer, scheduler, device)
