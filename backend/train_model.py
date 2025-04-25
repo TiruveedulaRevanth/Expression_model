@@ -12,7 +12,7 @@ from sklearn.utils import resample
 
 # Paths
 DATA_PATH = "C:\\Users\\revan\\Desktop\\face-mesh-react\\JoyVerseDataSet_Filled.xlsx"
-MODEL_DIR = "."
+MODEL_DIR = "model"
 os.makedirs(MODEL_DIR, exist_ok=True)
 
 # Check CUDA
@@ -64,7 +64,7 @@ joblib.dump(le, os.path.join(MODEL_DIR, "label_encoder.pkl"))
 # Dataset
 class ExpressionDataset(Dataset):
     def __init__(self, X, y):
-        assert X.shape[1] == 468 * 3, f"Expected 468*3 features, got {X.shape[1]}"
+        assert X.shape[1] == 1404, f"Expected 1404 features, got {X.shape[1]}"
         self.X = torch.tensor(X, dtype=torch.float32)
         self.y = torch.tensor(y, dtype=torch.long)
     def __len__(self):
@@ -74,7 +74,7 @@ class ExpressionDataset(Dataset):
 
 # Enhanced MLP Model
 class SimpleClassifier(nn.Module):
-    def __init__(self, input_dim=468*3, num_classes=6):
+    def __init__(self, input_dim=1404, num_classes=6):
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(input_dim, 512),
@@ -92,7 +92,7 @@ class SimpleClassifier(nn.Module):
             nn.Linear(128, num_classes)
         )
     def forward(self, x):
-        return self.net(x.flatten(1))
+        return self.net(x)
 
 # Training Function
 def train_model(train_loader, val_loader, model, criterion, optimizer, scheduler, device, epochs=100, patience=15):

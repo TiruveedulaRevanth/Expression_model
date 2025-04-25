@@ -1,10 +1,5 @@
 import json
-
-# Generate 1404 values (0.1 repeated)
-landmarks = [0.1] * (468 * 3)
-
-# Save to JSON file
+import numpy as np
+landmarks = np.random.uniform(0, 1, 1404).tolist()  # Random values for testing
 with open("landmarks.json", "w") as f:
     json.dump({"landmarks": landmarks}, f)
-
-print("Generated landmarks.json with 1404 values")

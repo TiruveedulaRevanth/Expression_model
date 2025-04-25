@@ -4,15 +4,23 @@ import torch
 import torch.nn as nn
 import numpy as np
 from joblib import load
-import time
-from datetime import datetime
+import os
+import logging
+
+# Set up logging
+logging.basicConfig(level=logging.DEBUG)
+logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 CORS(app, resources={r"/predict": {"origins": "http://localhost:5173"}})
 
+MODEL_PATH = os.path.join("model", "expression_classifier.pt")
+SCALER_PATH = os.path.join("model", "scaler.pkl")
+ENCODER_PATH = os.path.join("model", "label_encoder.pkl")
+
 # Model class
 class SimpleClassifier(nn.Module):
-    def __init__(self, input_dim=468*3, num_classes=6):
+    def __init__(self, input_dim=1404, num_classes=6):
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(input_dim, 512),
@@ -29,61 +37,65 @@ class SimpleClassifier(nn.Module):
             nn.Dropout(0.4),
             nn.Linear(128, num_classes)
         )
+
     def forward(self, x):
-        return self.net(x.flatten(1))
+        return self.net(x)
 
 # Load model and assets
 device = torch.device('cpu')
-try:
-    model = SimpleClassifier(num_classes=6).to(device)
-    model.load_state_dict(torch.load('expression_classifier.pt', map_location=device, weights_only=True))
-    model.eval()
-    scaler = load('scaler.pkl')
-    label_encoder = load('label_encoder.pkl')
-    print("Model and assets loaded successfully")
-except Exception as e:
-    print(f"Error loading model or assets: {e}")
-    exit(1)
+model = SimpleClassifier().to(device)
+model.load_state_dict(torch.load(MODEL_PATH, map_location=device, weights_only=True))  # Added weights_only=True
+model.eval()
+
+scaler = load(SCALER_PATH)
+label_encoder = load(ENCODER_PATH)
 
 @app.route('/predict', methods=['POST'])
 def predict():
+    # Log request details
+    logger.debug(f"Request headers: {request.headers}")
+    logger.debug(f"Content-Type: {request.content_type}")
+
+    # Validate Content-Type
+    if request.content_type != 'application/json':
+        logger.error("Invalid Content-Type")
+        return jsonify({'error': 'Content-Type must be application/json'}), 415
+
     try:
-        start_time = time.time()
         data = request.get_json()
-        if not data or 'landmarks' not in data:
-            return jsonify({'error': 'No landmarks provided'}), 400
-        
-        landmarks = np.array(data['landmarks'], dtype=np.float32)
-        print(f"[{datetime.now()}] Received landmarks: {len(data['landmarks'])}")
-        print(f"[{datetime.now()}] Landmarks shape: {landmarks.shape}")
-        print(f"[{datetime.now()}] Sample landmarks: {landmarks[:5]}")  # Log first few values
+        logger.debug(f"Received data: {data.keys()}")
 
-        if landmarks.shape[0] != 1404:
-            return jsonify({'error': f'Expected 1404 features, got {landmarks.shape[0]}'}), 400
-        if np.any(np.isnan(landmarks)) or np.any(np.isinf(landmarks)):
-            return jsonify({'error': 'Landmarks contain NaN or Inf values'}), 400
+        landmarks = data.get("landmarks")
+        if not landmarks or len(landmarks) != 1404:
+            logger.error(f"Invalid landmarks length: {len(landmarks) if landmarks else 'None'}")
+            return jsonify({'error': 'Expected 1404 landmark values'}), 400
 
-        landmarks = scaler.transform(landmarks.reshape(1, -1))
-        print(f"[{datetime.now()}] Scaled landmarks shape: {landmarks.shape}")
+        landmarks_np = np.array(landmarks, dtype=np.float32).reshape(1, -1)
+
+        if np.any(np.isnan(landmarks_np)) or np.any(np.isinf(landmarks_np)):
+            logger.error("Invalid values in landmarks")
+            return jsonify({'error': 'Invalid values in landmarks'}), 400
+
+        scaled = scaler.transform(landmarks_np)
+        tensor = torch.tensor(scaled, dtype=torch.float32).to(device)
 
         with torch.no_grad():
-            pred = model(torch.tensor(landmarks, dtype=torch.float32).to(device))
-            probs = torch.softmax(pred, dim=1).cpu().numpy()[0]
-            pred_idx = torch.argmax(pred, dim=1).item()
+            logits = model(tensor)
+            probs = torch.softmax(logits, dim=1).cpu().numpy()[0]
+            pred_idx = int(np.argmax(probs))
             expression = label_encoder.inverse_transform([pred_idx])[0]
-            confidence = float(probs[pred_idx])
-            print(f"[{datetime.now()}] Prediction output: {pred}")
-            print(f"[{datetime.now()}] Predicted expression: {expression} (Confidence: {confidence:.2f})")
+            confidence = round(float(probs[pred_idx]), 4)
 
-        print(f"[{datetime.now()}] Prediction took {time.time() - start_time:.3f} seconds")
+        logger.info(f"Prediction: {expression} ({confidence})")
         return jsonify({'expression': expression, 'confidence': confidence})
+
     except Exception as e:
-        print(f"[{datetime.now()}] Error: {str(e)}")
+        logger.exception(f"Prediction error: {str(e)}")
         return jsonify({'error': str(e)}), 500
 
 @app.route('/health', methods=['GET'])
 def health():
-    return jsonify({'status': 'Server is running'}), 200
+    return jsonify({'status': 'OK'})
 
 if __name__ == '__main__':
-    app.run(port=5000, debug=True)
+    app.run(port=5000, debug=True, host='0.0.0.0')  # Added host='0.0.0.0'
